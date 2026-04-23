@@ -8,6 +8,8 @@ import {
   severityClass,
   type DashboardTask,
 } from "@/components/worker-dashboard/dashboard-types"
+import { useTheme } from "@/components/ThemeProvider"
+import { getMapTileLayerConfig } from "@/lib/map-tiles"
 
 type WorkerTaskMapPanelProps = {
   tasks: DashboardTask[]
@@ -15,6 +17,7 @@ type WorkerTaskMapPanelProps = {
   loading: boolean
   error: string | null
   onSelectTask?: (taskId: string) => void
+  highQuality?: boolean
 }
 
 function createMarkerIcon(color: string, highlighted = false): L.DivIcon {
@@ -34,9 +37,35 @@ function FitMapToMarkers({ points }: { points: Array<{ lat: number; lng: number 
 
   useEffect(() => {
     if (points.length === 0) return
+    if (points.length === 1) {
+      map.setView([points[0].lat, points[0].lng], 14, { animate: false })
+      return
+    }
     const bounds = L.latLngBounds(points.map((point) => [point.lat, point.lng]))
-    map.fitBounds(bounds, { padding: [20, 20], maxZoom: 15 })
+    map.fitBounds(bounds, { padding: [8, 8], maxZoom: 16 })
   }, [map, points])
+
+  return null
+}
+
+function KeepMapSized({ resizeTrigger }: { resizeTrigger: number }) {
+  const map = useMap()
+
+  useEffect(() => {
+    const container = map.getContainer()
+    const invalidate = () => map.invalidateSize({ pan: false })
+
+    const frameId = window.requestAnimationFrame(invalidate)
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(invalidate) : null
+    observer?.observe(container)
+    window.addEventListener("resize", invalidate)
+
+    return () => {
+      window.cancelAnimationFrame(frameId)
+      observer?.disconnect()
+      window.removeEventListener("resize", invalidate)
+    }
+  }, [map, resizeTrigger])
 
   return null
 }
@@ -80,9 +109,15 @@ export default function WorkerTaskMapPanel({
   loading,
   error,
   onSelectTask,
+  highQuality = true,
 }: WorkerTaskMapPanelProps) {
+  const { theme } = useTheme()
   const [isClientReady, setIsClientReady] = useState(false)
   const [recenterTrigger, setRecenterTrigger] = useState(0)
+  const tileConfig = useMemo(
+    () => getMapTileLayerConfig({ theme, highQuality }),
+    [highQuality, theme],
+  )
   // Ensure each component mount gets a fresh Leaflet container identity.
   const mapSessionKey = useId()
 
@@ -117,7 +152,7 @@ export default function WorkerTaskMapPanel({
   )
 
   return (
-    <section className="rounded-xl border border-gray-200 bg-white p-3 shadow-sm sm:p-4 dark:border-[#2a2a2a] dark:bg-[#1e1e1e]">
+    <section className="flex h-full min-h-0 flex-col rounded-xl border border-gray-200 bg-white p-3 shadow-sm sm:p-4 dark:border-[#2a2a2a] dark:bg-[#1e1e1e]">
       <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 sm:text-base">Task Map</h2>
         <div className="flex items-center justify-between gap-2 sm:justify-end">
@@ -140,12 +175,18 @@ export default function WorkerTaskMapPanel({
 
       {loading ? <p className="mb-3 text-sm text-gray-500 dark:text-gray-400">Loading map...</p> : null}
 
-      <div className="relative h-[280px] overflow-hidden rounded-lg border border-gray-100 dark:border-[#2a2a2a] sm:h-[360px] lg:h-[420px]">
+      <div className="relative min-h-[380px] flex-1 overflow-hidden rounded-lg border border-gray-100 dark:border-[#2a2a2a]" style={{ height: "clamp(380px, 60vh, 620px)" }}>
+        <style>{`
+          .leaflet-container { height: 100% !important; }
+        `}</style>
         {isClientReady ? (
-          <MapContainer key={mapSessionKey} center={[28.6139, 77.209]} zoom={11} scrollWheelZoom className="h-full w-full">
+          <MapContainer key={mapSessionKey} center={[28.6139, 77.209]} zoom={12} scrollWheelZoom={true} style={{ height: "100%", width: "100%" }}>
             <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution="&copy; OpenStreetMap contributors"
+              attribution={tileConfig.attribution}
+              url={tileConfig.url}
+              detectRetina={tileConfig.detectRetina}
+              maxNativeZoom={tileConfig.maxNativeZoom}
+              subdomains={tileConfig.subdomains}
             />
 
             {mappableTasks.map((task) => (
@@ -176,6 +217,7 @@ export default function WorkerTaskMapPanel({
             <FitMapToMarkers
               points={mapPoints}
             />
+            <KeepMapSized resizeTrigger={recenterTrigger} />
             <ResetToTaskBounds points={mapPoints} recenterTrigger={recenterTrigger} />
             <ZoomToHighlightedTask task={highlightedPoint} />
           </MapContainer>

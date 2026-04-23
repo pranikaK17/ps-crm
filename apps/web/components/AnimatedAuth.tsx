@@ -44,6 +44,7 @@ export interface AnimatedAuthProps {
   signupTitle?: string;
   leftPanelImage?: string;
   rightPanelImage?: string;
+  redirectTo?: string;
 }
 
 const roles = ['admin', 'authority', 'citizen', 'worker'] as const;
@@ -127,6 +128,7 @@ export default function AnimatedAuth({
   signupTitle = 'Sign Up',
   leftPanelImage = '/Authsideimage.jpeg',
   rightPanelImage = '/Authsideimage.jpeg',
+  redirectTo,
 }: AnimatedAuthProps) {
   const { theme } = useTheme();
 
@@ -241,10 +243,14 @@ export default function AnimatedAuth({
       return;
     }
 
-    const token = recaptchaRef.current?.getValue();
+    let token = recaptchaRef.current?.getValue();
     if (!token) {
-      setError('Please complete the reCAPTCHA.');
-      return;
+      if (process.env.NODE_ENV === 'development') {
+        token = 'dev_mock_token';
+      } else {
+        setError('Please complete the reCAPTCHA.');
+        return;
+      }
     }
 
     const verifyRes = await fetch('/api/verify-recaptcha', {
@@ -308,7 +314,7 @@ export default function AnimatedAuth({
     }
 
     setLoading(false);
-    router.push(`/${profile.role}`);
+    router.push(redirectTo || `/${profile.role}`);
   };
 
   const handleSignup = async () => {
@@ -492,10 +498,12 @@ export default function AnimatedAuth({
                 setError('reCAPTCHA expired. Please complete it again.');
               }}
               onErrored={() => {
-                console.error(
-                  'reCAPTCHA widget error. This usually means the site key is invalid for this domain or key type.'
+                console.warn(
+                  'reCAPTCHA widget error. The site key may be restricted by domain (e.g., localhost is not whitelisted) or key type.'
                 );
-                setError('reCAPTCHA failed to load. Please try again later.');
+                if (process.env.NODE_ENV !== 'development') {
+                  setError('reCAPTCHA failed to load. Please try again later.');
+                }
               }}
             />
           ) : (

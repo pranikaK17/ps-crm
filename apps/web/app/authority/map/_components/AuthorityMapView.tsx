@@ -2,7 +2,7 @@
 
 "use client"
 
-import React, { useCallback, useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   MapContainer,
   TileLayer,
@@ -21,6 +21,8 @@ import {
   UserCheck,
 } from "lucide-react"
 import { supabase } from "@/src/lib/supabase"
+import { useTheme } from "@/components/ThemeProvider"
+import { getMapTileLayerConfig } from "@/lib/map-tiles"
 
 // Dynamically import MarkerClusterGroup with no SSR
 const MarkerClusterGroup = dynamic(
@@ -42,6 +44,9 @@ type ComplaintStatus =
   | "resolved"
   | "rejected"
   | "escalated"
+  | "reopened"
+  | "pending_closure"
+  | "spam"
 
 type SeverityLevel = "L1" | "L2" | "L3" | "L4"
 
@@ -161,6 +166,9 @@ const STATUS_BADGE: Record<ComplaintStatus, string> = {
   resolved:     "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300",
   rejected:     "bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400",
   escalated:    "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300",
+  reopened:     "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
+  pending_closure: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400",
+  spam:         "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
 }
 
 const STATUS_LABEL: Record<ComplaintStatus, string> = {
@@ -171,6 +179,9 @@ const STATUS_LABEL: Record<ComplaintStatus, string> = {
   resolved:     "Resolved",
   rejected:     "Rejected",
   escalated:    "Escalated",
+  reopened:     "Reopened",
+  pending_closure: "Pending Verification",
+  spam:         "Spam",
 }
 
 // ─── Heatmap layer ────────────────────────────────────────────────────────────
@@ -234,7 +245,7 @@ function AssignDropdown({
 }: {
   ticket: MapTicket
   workers: WorkerOption[]
-  onAssigned: (ticketId: string) => void
+  onAssigned: (ticketId: string, workerId: string) => void
 }) {
   const [open,   setOpen]   = useState(false)
   const [chosen, setChosen] = useState("")
@@ -245,13 +256,40 @@ function AssignDropdown({
   async function confirm() {
     if (!chosen) return
     setSaving(true)
-    await supabase
-      .from("complaints")
-      .update({ assigned_worker_id: chosen, status: "assigned" })
-      .eq("id", ticket.id)
-    setSaving(false)
-    setOpen(false)
-    onAssigned(ticket.id)
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession()
+      if (!session?.access_token) {
+        throw new Error("Not authenticated")
+      }
+
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+      const response = await fetch(`${apiUrl}/api/authority/assign`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          complaint_id: ticket.id,
+          worker_id: chosen,
+          status: "assigned",
+        }),
+      })
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}))
+        throw new Error(errData?.detail || "Failed to assign worker")
+      }
+
+      setOpen(false)
+      onAssigned(ticket.id, chosen)
+    } catch (err) {
+      console.error("[AuthorityMap] Assignment failed:", err)
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -334,7 +372,7 @@ function TicketDetailPanel({
   ticket: MapTicket
   workers: WorkerOption[]
   onClose: () => void
-  onAssigned: (id: string) => void
+  onAssigned: (id: string, workerId: string) => void
 }) {
   const canAssign =
     !ticket.assigned_worker_id &&
@@ -484,6 +522,8 @@ const STATUS_OPTIONS: { value: ComplaintStatus | "all"; label: string }[] = [
   { value: "assigned",     label: "Assigned" },
   { value: "in_progress",  label: "In Progress" },
   { value: "escalated",    label: "Escalated" },
+  { value: "reopened",     label: "Reopened" },
+  { value: "spam",         label: "Spam" },
 ]
 
 const SEV_OPTIONS: { value: SeverityLevel | "all"; label: string }[] = [
@@ -496,7 +536,8 @@ const SEV_OPTIONS: { value: SeverityLevel | "all"; label: string }[] = [
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export default function AuthorityMapView() {
+export default function AuthorityMapView({ highQuality = true }: { highQuality?: boolean }) {
+  const { theme } = useTheme()
   const [leafletLib,     setLeafletLib]     = useState<any>(null)
   const [tickets,        setTickets]        = useState<MapTicket[]>([])
   const [workers,        setWorkers]        = useState<WorkerOption[]>([])
@@ -507,6 +548,10 @@ export default function AuthorityMapView() {
   const [statusFilter,   setStatusFilter]   = useState<ComplaintStatus | "all">("all")
   const [sevFilter,      setSevFilter]      = useState<SeverityLevel | "all">("all")
   const [department,     setDepartment]     = useState("")
+  const tileConfig = useMemo(
+    () => getMapTileLayerConfig({ theme, highQuality }),
+    [highQuality, theme]
+  )
 
   // ── Init Leaflet ─────────────────────────────────────────────────────────
 
@@ -637,17 +682,17 @@ export default function AuthorityMapView() {
     })
   }
 
-  function handleAssigned(ticketId: string) {
+  function handleAssigned(ticketId: string, workerId: string) {
     setTickets(prev =>
       prev.map(t =>
         t.id === ticketId
-          ? { ...t, assigned_worker_id: "assigned", status: "assigned" as ComplaintStatus }
+          ? { ...t, assigned_worker_id: workerId, status: "assigned" as ComplaintStatus }
           : t
       )
     )
     setSelectedTicket(prev =>
       prev?.id === ticketId
-        ? { ...prev, assigned_worker_id: "assigned", status: "assigned" as ComplaintStatus }
+        ? { ...prev, assigned_worker_id: workerId, status: "assigned" as ComplaintStatus }
         : prev
     )
   }
@@ -773,8 +818,11 @@ export default function AuthorityMapView() {
               style={{ height: "100%", width: "100%" }}
             >
               <TileLayer
-                attribution="© OpenStreetMap contributors"
-                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                attribution={tileConfig.attribution}
+                url={tileConfig.url}
+                detectRetina={tileConfig.detectRetina}
+                maxNativeZoom={tileConfig.maxNativeZoom}
+                subdomains={tileConfig.subdomains}
               />
 
               {showHeatmap && <HeatmapLayer tickets={visible} />}

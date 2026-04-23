@@ -35,6 +35,8 @@ type ComplaintRow = {
   assigned_department: string | null
   assigned_worker_id: string | null
   assigned_officer_id: string | null
+  citizen_id: string
+  is_spam: boolean
   categories: CategoryRelation | CategoryRelation[] | null
 }
 
@@ -99,6 +101,8 @@ function normalizeTicket(row: ComplaintRow, profilesById: Record<string, Profile
     createdAt: row.created_at,
     authority,
     worker: workerProfile?.full_name ?? "Unassigned",
+    citizenId: row.citizen_id,
+    isSpam: row.is_spam,
   }
 }
 
@@ -236,8 +240,7 @@ export default function TicketsPage() {
     })
 
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
-      const response = await fetch(`${apiUrl}/api/admin/complaints?${query.toString()}`, {
+      const response = await fetch(`/api/admin/complaints?${query.toString()}`, {
         method: "GET",
         headers: { Authorization: `Bearer ${session.access_token}` },
       })
@@ -292,6 +295,15 @@ export default function TicketsPage() {
       setActionLoading(true)
       setError(null)
 
+      const {
+        data: { session },
+      } = await supabase.auth.getSession()
+      if (!session?.access_token) {
+        setError("You must be logged in as admin")
+        setActionLoading(false)
+        return
+      }
+
       const { error: updateError } = await supabase
         .from("complaints")
         .update({ status: "escalated", escalation_level: (ticket.escalationLevel ?? 0) + 1 })
@@ -314,10 +326,65 @@ export default function TicketsPage() {
         })
       }
 
+      try {
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+        await fetch(`${apiUrl}/api/notifications/complaint-email`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            complaint_id: ticket.id,
+            event_type: "status_changed",
+            status: "escalated",
+          }),
+        })
+      } catch (err) {
+        console.error("Failed to request escalation status email:", err)
+      }
+
       await fetchTickets()
       setActionLoading(false)
     },
     [fetchTickets],
+  )
+
+  const handleMarkSpam = useCallback(
+    async (ticket: TicketRecord) => {
+      const confirmed = window.confirm(`Mark ticket ${ticket.ticketId} as spam? Points will be deducted from the user.`)
+      if (!confirmed) return
+
+      setActionLoading(true)
+      setError(null)
+
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
+        const response = await fetch('/api/admin/complaints/spam', {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${session?.access_token}`
+          },
+          body: JSON.stringify({ 
+            complaint_id: ticket.id,
+            citizen_id: ticket.citizenId
+          })
+        })
+
+        if (!response.ok) {
+          const payload = await response.json()
+          throw new Error(payload.error || "Failed to mark as spam")
+        }
+
+        await fetchTickets()
+      } catch (err: any) {
+        setError(err.message)
+      } finally {
+        setActionLoading(false)
+      }
+    },
+    [fetchTickets]
   )
 
   const handleAssignWorker = useCallback(async () => {
@@ -325,50 +392,42 @@ export default function TicketsPage() {
 
     setActionLoading(true)
     setError(null)
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession()
+      if (!session?.access_token) {
+        throw new Error("You must be logged in as admin")
+      }
 
-    const selectedWorker = workers.find((worker) => worker.id === assignWorkerId) ?? null
-    const nextStatus =
-      selectedTicket.status === "submitted" || selectedTicket.status === "under_review"
-        ? "assigned"
-        : selectedTicket.status
-
-    const payload: {
-      assigned_worker_id: string
-      status: Enums<"complaint_status">
-      assigned_department?: string
-    } = {
-      assigned_worker_id: assignWorkerId,
-      status: nextStatus,
-    }
-
-    if (selectedWorker?.department) {
-      payload.assigned_department = selectedWorker.department
-    }
-
-    const { error: updateError } = await supabase.from("complaints").update(payload).eq("id", selectedTicket.id)
-
-    if (updateError) {
-      setError(updateError.message || "Failed to assign worker")
-      setActionLoading(false)
-      return
-    }
-
-    const { data: authData } = await supabase.auth.getUser()
-    if (authData.user) {
-      await supabase.from("ticket_history").insert({
-        changed_by: authData.user.id,
-        complaint_id: selectedTicket.id,
-        old_status: selectedTicket.status,
-        new_status: nextStatus,
-        note: `Assigned worker from admin complaints dashboard (${assignWorkerId})`,
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+      const response = await fetch(`${apiUrl}/api/authority/assign`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          complaint_id: selectedTicket.id,
+          worker_id: assignWorkerId,
+          status: "assigned",
+        }),
       })
-    }
 
-    setIsAssignOpen(false)
-    setSelectedTicket(null)
-    await fetchTickets()
-    setActionLoading(false)
-  }, [assignWorkerId, fetchTickets, selectedTicket, workers])
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}))
+        throw new Error(payload.detail || "Failed to assign worker")
+      }
+
+      setIsAssignOpen(false)
+      setSelectedTicket(null)
+      await fetchTickets()
+    } catch (err: any) {
+      setError(err.message || "Failed to assign worker")
+    } finally {
+      setActionLoading(false)
+    }
+  }, [assignWorkerId, fetchTickets, selectedTicket])
 
   // ── Instant Load from localStorage, then fresh fetch ──
   useEffect(() => {
@@ -444,6 +503,7 @@ export default function TicketsPage() {
         onView={handleView}
         onAssign={handleOpenAssign}
         onEscalate={handleEscalate}
+        onSpam={handleMarkSpam}
         highlightTicketId={highlightTicketId}
       />
 
@@ -482,6 +542,7 @@ export default function TicketsPage() {
               <p><span className="font-semibold">Authority:</span> {selectedTicket.authority}</p>
               <p><span className="font-semibold">Worker:</span> {selectedTicket.worker}</p>
               <p><span className="font-semibold">Created:</span> {new Date(selectedTicket.createdAt).toLocaleString("en-IN")}</p>
+              <p><span className="font-semibold">Is Spam:</span> {selectedTicket.isSpam ? "Yes" : "No"}</p>
               <p className="sm:col-span-2"><span className="font-semibold">Location:</span> {selectedTicket.location}</p>
             </div>
           </div>

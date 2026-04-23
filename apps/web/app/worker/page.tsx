@@ -17,6 +17,7 @@ import {
   type DashboardTask,
 } from "@/components/worker-dashboard/dashboard-types"
 import CurrentTicketCard from "@/components/worker-dashboard/CurrentTicketCard"
+import PendingTicketCard from "@/components/worker-dashboard/PendingTicketCard"
 
 const WorkerTaskMapPanel = dynamic(() => import("@/components/worker-dashboard/WorkerTaskMapPanel"), {
   ssr: false,
@@ -34,13 +35,19 @@ type ComplaintWithCategory = {
     | "under_review"
     | "assigned"
     | "in_progress"
+    | "pending_closure"
     | "resolved"
     | "rejected"
     | "escalated"
+    | "reopened"
   created_at: string
   resolved_at: string | null
   location: unknown
+  sla_breached: boolean
+  sla_deadline: string | null
   categories: { name: string } | null
+  is_spam: boolean
+  camera_id: string | null  // present on CCTV auto-generated tickets
 }
 
 type ProfileAccessRow = {
@@ -66,6 +73,8 @@ type WorkerDashboardPayload = {
   }[]
 }
 
+const ACTIONABLE_STATUSES: DashboardTask["status"][] = ["assigned", "reopened", "in_progress", "escalated"]
+
 function transformPayload(payload: WorkerDashboardPayload) {
     const workerLocation = parseLatLng(payload.workerProfile?.last_location)
     const normalizedTasks = (payload.complaints ?? []).map((complaint) => {
@@ -87,6 +96,10 @@ function transformPayload(payload: WorkerDashboardPayload) {
         latitude: complaintLocation?.lat ?? null,
         longitude: complaintLocation?.lng ?? null,
         distanceKm,
+        cameraId: complaint.camera_id ?? null,
+        slaBreached: complaint.sla_breached ?? false,
+        slaDeadline: complaint.sla_deadline ?? null,
+        isSpam: complaint.is_spam || false,
       } satisfies DashboardTask
     })
 
@@ -128,6 +141,8 @@ export default function WorkerDashboardPage() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [isCompletionModalOpen, setIsCompletionModalOpen] = useState(false)
   const [completionNote, setCompletionNote] = useState("")
+  const [proofPhoto, setProofPhoto] = useState<File | null>(null)
+  const [isSubmitting, setIsSubmitting] = useState(false)
 
   const applyPayload = useCallback((payload: WorkerDashboardPayload) => {
     const result = transformPayload(payload)
@@ -207,6 +222,27 @@ export default function WorkerDashboardPage() {
   // PERFORMANCE OPTIMIZATION: Removed 15s polling. 
   // We now rely entirely on the Realtime channels below for updates.
 
+  // Invalidate Redis cache then fetch fresh data — used by realtime handlers
+  // so the re-fetch doesn't just return stale cached data.
+  const invalidateAndFetch = useCallback(async () => {
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (session?.access_token) {
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+        await fetch(`${apiUrl}/api/worker/dashboard/invalidate`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      }
+    } catch (err) {
+      console.error("Cache invalidation failed:", err)
+    }
+    await fetchDashboardData()
+  }, [fetchDashboardData])
+
   // ── Realtime sync: listen for external changes ──────────────────────────────
   useEffect(() => {
     if (!workerId) return
@@ -217,7 +253,7 @@ export default function WorkerDashboardPage() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "complaints", filter: `assigned_worker_id=eq.${workerId}` },
-        () => void fetchDashboardData(),
+        () => void invalidateAndFetch(),
       )
       // Catch tickets being reassigned AWAY from this worker (old row had our id, new row doesn't)
       .on(
@@ -226,7 +262,7 @@ export default function WorkerDashboardPage() {
         (payload) => {
           const old = payload.old as { assigned_worker_id?: string }
           if (old.assigned_worker_id === workerId) {
-            void fetchDashboardData()
+            void invalidateAndFetch()
           }
         },
       )
@@ -234,24 +270,24 @@ export default function WorkerDashboardPage() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "worker_profiles", filter: `worker_id=eq.${workerId}` },
-        () => void fetchDashboardData(),
+        () => void invalidateAndFetch(),
       )
       // Activity feed: new ticket_history entry by this worker
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "ticket_history", filter: `changed_by=eq.${workerId}` },
-        () => void fetchDashboardData(),
+        () => void invalidateAndFetch(),
       )
       .subscribe()
 
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [workerId, fetchDashboardData])
+  }, [workerId, invalidateAndFetch])
 
   const sortedAssignedTasks = useMemo(() => {
     return tasks
-      .filter((task) => task.status === "assigned")
+      .filter((task) => task.status === "assigned" || task.status === "reopened")
       .sort((a, b) => {
         if (severityWeight[b.severity] !== severityWeight[a.severity]) {
           return severityWeight[b.severity] - severityWeight[a.severity]
@@ -266,19 +302,208 @@ export default function WorkerDashboardPage() {
 
     return {
       tasksToday: tasks.filter((task) => new Date(task.createdAt).getTime() >= startOfDay).length,
-      pending: tasks.filter((task) => task.status === "assigned").length,
+      pending: tasks.filter((task) => task.status === "assigned" || task.status === "reopened").length,
       completedToday: tasks.filter(
-        (task) => task.status === "resolved" && task.resolvedAt && new Date(task.resolvedAt).getTime() >= startOfDay,
+        (task) => task.status === "resolved" && !task.isSpam && task.resolvedAt && new Date(task.resolvedAt).getTime() >= startOfDay,
       ).length,
-      urgent: tasks.filter((task) => task.status !== "resolved" && (task.severity === "L3" || task.severity === "L4")).length,
+      urgent: tasks.filter((task) => ACTIONABLE_STATUSES.includes(task.status) && task.slaBreached).length,
     } satisfies DashboardStats
   }, [tasks])
 
+  const actionableTasks = useMemo(
+    () => tasks.filter((task) => ACTIONABLE_STATUSES.includes(task.status)),
+    [tasks],
+  )
+
   const currentTask = useMemo(() => tasks.find((task) => task.status === "in_progress") ?? null, [tasks])
-  const urgentTask = useMemo(() => (sortedAssignedTasks.length > 0 ? sortedAssignedTasks[0] : null), [sortedAssignedTasks])
+  const urgentTask = useMemo(
+    () =>
+      actionableTasks.find(
+        (task) => task.slaBreached && (task.status === "in_progress" || task.status === "escalated"),
+      ) ??
+      actionableTasks.find((task) => task.slaBreached) ??
+      null,
+    [actionableTasks],
+  )
+
+  const pendingTask = useMemo(() => sortedAssignedTasks[0] ?? null, [sortedAssignedTasks])
+
+  const emitSupervisedSampleEvent = useCallback(
+    async (params: {
+      complaintId: string
+      eventType: "present" | "absent" | "repair_complete"
+      cameraId?: string | null
+      proofPhotoUrl?: string | null
+    }) => {
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession()
+        if (!session?.access_token) return
+
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+        const response = await fetch(`${apiUrl}/api/worker/supervised-samples`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            complaint_id: params.complaintId,
+            event_type: params.eventType,
+            camera_id: params.cameraId ?? null,
+            proof_photo_url: params.proofPhotoUrl ?? null,
+            source: "worker_dashboard",
+          }),
+        })
+
+        if (!response.ok) {
+          const bodyText = await response.text().catch(() => "")
+          console.warn("[WORKER][SAMPLE_EVENT] API returned non-200", {
+            complaintId: params.complaintId,
+            eventType: params.eventType,
+            status: response.status,
+            bodyText,
+          })
+          return
+        }
+
+        const result = await response.json().catch(() => null)
+        console.info("[WORKER][SAMPLE_EVENT] emitted", {
+          complaintId: params.complaintId,
+          eventType: params.eventType,
+          result,
+        })
+      } catch (err) {
+        console.warn("[WORKER][SAMPLE_EVENT] emission failed", {
+          complaintId: params.complaintId,
+          eventType: params.eventType,
+          err,
+        })
+      }
+    },
+    [],
+  )
+
+  const notifyComplaintEmail = useCallback(
+    async (params: { complaintId: string; status: string; workerIdOverride?: string | null }) => {
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession()
+        if (!session?.access_token) return
+
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+        const response = await fetch(`${apiUrl}/api/notifications/complaint-email`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            complaint_id: params.complaintId,
+            event_type: "status_changed",
+            status: params.status,
+            worker_id_override: params.workerIdOverride ?? undefined,
+          }),
+        })
+
+        if (!response.ok) {
+          const bodyText = await response.text().catch(() => "")
+          console.error("[WORKER] complaint email notification failed", {
+            complaintId: params.complaintId,
+            status: params.status,
+            responseStatus: response.status,
+            bodyText,
+          })
+        }
+      } catch (err) {
+        console.error("[WORKER] complaint email notification error", {
+          complaintId: params.complaintId,
+          status: params.status,
+          err,
+        })
+      }
+    },
+    [],
+  )
+
+  const handleMarkAbsent = useCallback(
+    async (complaintId: string) => {
+      if (!workerId) return
+
+      const task = tasks.find((item) => item.id === complaintId)
+      if (!task) return
+
+      const updates: Record<string, unknown> = {
+        status: "rejected",
+        assigned_worker_id: null,
+        rejection_reason: "worker_absent_confirmed",
+      }
+
+      const { error: complaintError } = await supabase.from("complaints").update(updates).eq("id", complaintId)
+
+      if (complaintError) {
+        setError(`Failed to mark complaint ${task.ticketId} absent.`)
+        return
+      }
+
+      if (task.cameraId) {
+        await supabase.from("cctv_cameras").update({ last_status: "No Issue Detected" }).eq("id", task.cameraId)
+      }
+
+      await supabase.from("ticket_history").insert({
+        changed_by: workerId,
+        complaint_id: complaintId,
+        old_status: task.status,
+        new_status: "rejected",
+        note: "Worker marked ticket absent/no issue detected on site.",
+        is_internal: false,
+      })
+
+      await notifyComplaintEmail({
+        complaintId,
+        status: "rejected",
+        workerIdOverride: workerId,
+      })
+
+      if (task.cameraId) {
+        await emitSupervisedSampleEvent({
+          complaintId,
+          eventType: "absent",
+          cameraId: task.cameraId,
+        })
+      }
+
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession()
+        if (session?.access_token) {
+          const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+          await fetch(`${apiUrl}/api/worker/dashboard/invalidate`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${session.access_token}` },
+          })
+        }
+      } catch (err) {
+        console.error("Cache invalidation failed:", err)
+      }
+
+      if (task.assignedWorkerId === workerId) {
+        await supabase
+          .from("worker_profiles")
+          .update({ current_complaint_id: null, availability: "available" })
+          .eq("worker_id", workerId)
+      }
+
+      fetchDashboardData()
+    },
+    [emitSupervisedSampleEvent, fetchDashboardData, notifyComplaintEmail, tasks, workerId],
+  )
 
   const updateTaskStatus = useCallback(
-    async (complaintId: string, nextStatus: "in_progress" | "resolved" | "escalated", note?: string) => {
+    async (complaintId: string, nextStatus: "in_progress" | "pending_closure" | "resolved" | "escalated", note?: string) => {
       if (!workerId) return
 
       const task = tasks.find((item) => item.id === complaintId)
@@ -287,7 +512,7 @@ export default function WorkerDashboardPage() {
       const { error: updateError } = await supabase
         .from("complaints")
         .update({
-          status: nextStatus,
+          status: nextStatus as any,
           resolved_at: nextStatus === "resolved" ? new Date().toISOString() : null,
         })
         .eq("id", complaintId)
@@ -310,12 +535,42 @@ export default function WorkerDashboardPage() {
         setError("Task updated, but activity log write failed.")
       }
 
+      await notifyComplaintEmail({
+        complaintId,
+        status: nextStatus,
+        workerIdOverride: workerId,
+      })
+
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
+        if (session?.access_token) {
+          const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+          await fetch(`${apiUrl}/api/worker/dashboard/invalidate`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${session.access_token}` },
+          })
+        }
+      } catch (err) {
+        console.error("Cache invalidation failed:", err)
+      }
+
       if (nextStatus === "in_progress") {
         await supabase
           .from("worker_profiles")
           .update({ current_complaint_id: complaintId, availability: "busy" })
           .eq("worker_id", workerId)
+
+        if (task.cameraId) {
+          await emitSupervisedSampleEvent({
+            complaintId,
+            eventType: "present",
+            cameraId: task.cameraId,
+          })
+        }
       }
+
+      // pending_closure: worker stays busy, ticket is awaiting citizen confirmation
+      // Don't clear current_complaint_id or set availability to available
 
       if (nextStatus === "resolved") {
         await supabase
@@ -333,14 +588,32 @@ export default function WorkerDashboardPage() {
 
       fetchDashboardData()
     },
-    [fetchDashboardData, tasks, workerId],
+    [emitSupervisedSampleEvent, fetchDashboardData, notifyComplaintEmail, tasks, workerId],
   )
 
   const handleCompleteTask = useCallback(
     async (complaintId: string) => {
-      await updateTaskStatus(complaintId, "resolved", "Completed from worker dashboard")
+      await updateTaskStatus(complaintId, "pending_closure", completionNote.trim() || "Completed from worker dashboard")
+
+      // Trigger WhatsApp notification to the citizen
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
+        if (session?.access_token) {
+          const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+          await fetch(`${apiUrl}/api/notify/closure-confirmation`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${session.access_token}`,
+            },
+            body: JSON.stringify({ complaint_id: complaintId }),
+          })
+        }
+      } catch (err) {
+        console.error("WhatsApp notification failed (non-blocking):", err)
+      }
     },
-    [updateTaskStatus],
+    [updateTaskStatus, completionNote],
   )
 
   const handleUpdateProgress = useCallback(
@@ -373,18 +646,34 @@ export default function WorkerDashboardPage() {
     [tasks, workerId],
   )
 
-  const selectedTask = useMemo(
-    () => (selectedTaskId ? tasks.find((task) => task.id === selectedTaskId) ?? null : null),
-    [selectedTaskId, tasks],
-  )
+  const selectedTask = useMemo(() => {
+    if (!selectedTaskId) return null
+    const task = tasks.find((item) => item.id === selectedTaskId) ?? null
+    if (!task) return null
+    if (!ACTIONABLE_STATUSES.includes(task.status)) return null
+    return task
+  }, [selectedTaskId, tasks])
 
   const handleSelectTask = useCallback((taskId: string) => {
     setSelectedTaskId(taskId)
   }, [])
 
+  const escalatedTask = useMemo(
+    () => actionableTasks.find((task) => task.status === "escalated") ?? null,
+    [actionableTasks],
+  )
+
   const displayTask = useMemo(() => {
-    return selectedTask
-  }, [selectedTask])
+    return selectedTask ?? currentTask ?? urgentTask ?? escalatedTask ?? null
+  }, [currentTask, escalatedTask, selectedTask, urgentTask])
+
+  useEffect(() => {
+    if (!selectedTaskId) return
+    const selected = tasks.find((task) => task.id === selectedTaskId)
+    if (!selected || !ACTIONABLE_STATUSES.includes(selected.status)) {
+      setSelectedTaskId(null)
+    }
+  }, [selectedTaskId, tasks])
 
   const statsCards = useMemo(
     () => [
@@ -418,31 +707,161 @@ export default function WorkerDashboardPage() {
 
   async function handleConfirmComplete() {
     if (!displayTask) return
-    await handleCompleteTask(displayTask.id)
-    setIsCompletionModalOpen(false)
-    setCompletionNote("")
+    setIsSubmitting(true)
+
+    try {
+      let proofPhotoUrl: string | null = null
+
+      // 1. Upload proof photo if provided
+      if (proofPhoto) {
+        const ext = proofPhoto.name.split('.').pop()
+        const path = `worker-proofs/${displayTask.id}_${Date.now()}.${ext}`
+        const { data: uploadData, error: uploadErr } = await supabase.storage
+          .from('worker-proofs')
+          .upload(path, proofPhoto, { upsert: true })
+        if (uploadErr) {
+          console.error('[WORKER] proof upload error:', uploadErr)
+        } else {
+          const { data: urlData } = supabase.storage.from('worker-proofs').getPublicUrl(uploadData.path)
+          proofPhotoUrl = urlData.publicUrl
+        }
+      }
+
+      // 2. Complaint moves to pending_closure; linked CCTV camera badge moves to Pending Verification.
+      const nextStatus = 'pending_closure'
+
+      // Resolve camera link from DB so existing tickets with missing local camera_id
+      // can still transition the surveillance card to Pending Verification.
+      let resolvedCameraId: string | null = displayTask.cameraId
+      if (!resolvedCameraId) {
+        const { data: complaintRow } = await supabase
+          .from('complaints')
+          .select('camera_id')
+          .eq('id', displayTask.id)
+          .maybeSingle()
+        resolvedCameraId = (complaintRow as { camera_id?: string | null } | null)?.camera_id ?? null
+      }
+
+      if (!resolvedCameraId && displayTask.ticketId) {
+        const { data: cameraRow } = await supabase
+          .from('cctv_cameras')
+          .select('id')
+          .eq('generated_ticket_id', displayTask.ticketId)
+          .maybeSingle()
+
+        resolvedCameraId = (cameraRow as { id?: string } | null)?.id ?? null
+
+        if (resolvedCameraId) {
+          await supabase
+            .from('complaints')
+            .update({ camera_id: resolvedCameraId })
+            .eq('id', displayTask.id)
+        }
+      }
+
+      console.info('[WORKER][COMPLETE] CCTV linkage resolution', {
+        complaintId: displayTask.id,
+        ticketId: displayTask.ticketId,
+        resolvedCameraId,
+        sourceCameraId: displayTask.cameraId,
+      })
+
+      // 3. Update complaint status + store proof URL
+      const updatePayload: Record<string, unknown> = {
+        status: nextStatus,
+      }
+      if (proofPhotoUrl) updatePayload['proof_photo_url'] = proofPhotoUrl
+
+      const { error: updateErr } = await supabase
+        .from('complaints')
+        .update(updatePayload)
+        .eq('id', displayTask.id)
+
+      if (updateErr) {
+        console.error('[WORKER] complaint update error:', updateErr)
+        setError('Failed to update ticket. Please try again.')
+        return
+      }
+
+      // 4. Trigger Notifications if normal ticket
+      if (!resolvedCameraId) {
+        try {
+          const { data: { session } } = await supabase.auth.getSession()
+          if (session?.access_token) {
+            const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+            await fetch(`${apiUrl}/api/notify/closure-confirmation`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${session.access_token}`,
+              },
+              body: JSON.stringify({ complaint_id: displayTask.id }),
+            })
+          }
+        } catch (err) {
+          console.error("WhatsApp notification failed (non-blocking):", err)
+        }
+      }
+
+      // 5. If this is a CCTV ticket, trigger Pending Verification on the camera card
+      if (resolvedCameraId) {
+        const sbAny = supabase as any
+        const { error: camErr } = await sbAny
+          .from('cctv_cameras')
+          .update({ last_status: 'Pending Verification', verification_status: 'pending' })
+          .eq('id', resolvedCameraId)
+        if (camErr) {
+          console.error('[WORKER] camera status update error:', camErr)
+        } else {
+          console.info('[WORKER][COMPLETE] Camera moved to Pending Verification', {
+            complaintId: displayTask.id,
+            ticketId: displayTask.ticketId,
+            cameraId: resolvedCameraId,
+          })
+        }
+      }
+
+      // 6. Log to ticket_history
+      if (workerId) {
+        await supabase.from('ticket_history').insert({
+          changed_by: workerId,
+          complaint_id: displayTask.id,
+          old_status: displayTask.status,
+          new_status: nextStatus,
+          note: completionNote || (resolvedCameraId ? 'Worker marked repair complete. Awaiting CCTV verification.' : 'Worker marked complete. Awaiting citizen confirmation.'),
+          is_internal: false,
+        })
+      }
+
+      await notifyComplaintEmail({
+        complaintId: displayTask.id,
+        status: nextStatus,
+        workerIdOverride: workerId,
+      })
+
+      if (proofPhotoUrl && resolvedCameraId) {
+        await emitSupervisedSampleEvent({
+          complaintId: displayTask.id,
+          eventType: "repair_complete",
+          cameraId: resolvedCameraId,
+          proofPhotoUrl,
+        })
+      }
+
+      setIsCompletionModalOpen(false)
+      setCompletionNote('')
+      setProofPhoto(null)
+      fetchDashboardData()
+    } catch (err) {
+      console.error('[WORKER] handleConfirmComplete error:', err)
+      setError('Unexpected error. Please try again.')
+    } finally {
+      setIsSubmitting(false)
+    }
   }
 
   return (
-    <div className="flex min-h-full flex-col gap-3 overflow-visible lg:gap-4">
-      <div className="flex items-center justify-between gap-4">
-        <h1 className="text-xl font-bold text-gray-900 dark:text-white sm:text-2xl">Worker Dashboard</h1>
-        
-        <div className="flex items-center gap-2">
-          {loading && (
-            <div className="flex items-center gap-2 rounded-full border border-gray-100 bg-white/80 px-2 py-1 text-[10px] font-medium text-gray-400 shadow-sm backdrop-blur-sm dark:border-[#2a2a2a] dark:bg-[#1a1a1a]/80">
-              <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
-              Syncing...
-            </div>
-          )}
-          {error && (
-            <div className="shrink-0 rounded-full border border-red-200 bg-red-50 px-3 py-1 text-[10px] font-medium text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
-              {error}
-            </div>
-          )}
-        </div>
-      </div>
-
+    <div className="flex h-full min-h-full flex-col gap-4 overflow-visible lg:gap-5">
       <section className="shrink-0 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
         {statsCards.map((card) => {
           const Icon = card.icon
@@ -462,8 +881,8 @@ export default function WorkerDashboardPage() {
         })}
       </section>
 
-      <section className="grid min-h-0 grid-cols-1 gap-4 xl:grid-cols-4">
-        <div className="min-h-0 space-y-4 overflow-visible xl:col-span-3 xl:pr-1">
+      <section className="grid min-h-0 flex-1 grid-cols-1 gap-4 xl:grid-cols-4">
+        <div className="min-h-0 h-full space-y-4 overflow-visible xl:col-span-3 xl:pr-1">
           <WorkerTaskMapPanel
             tasks={mapTasks}
             loading={loading}
@@ -473,40 +892,63 @@ export default function WorkerDashboardPage() {
           />
         </div>
 
-        {displayTask ? (
-          <aside className="min-h-0 overflow-visible xl:col-span-1 xl:pr-1">
-            <section className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-[#2a2a2a] dark:bg-[#1e1e1e]">
-              <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Ticket Details</h2>
-                <button
-                  type="button"
-                  onClick={() => setSelectedTaskId(null)}
-                  className="rounded-md border border-gray-300 px-2.5 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100 dark:border-[#3a3a3a] dark:text-gray-200 dark:hover:bg-[#2a2a2a]"
-                >
-                  Close
-                </button>
-              </div>
+        <aside className="min-h-0 h-full overflow-visible xl:col-span-1 xl:pr-1">
+          <div className="flex h-full flex-col gap-4">
+            {displayTask ? (
+              <section className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-[#2a2a2a] dark:bg-[#1e1e1e]">
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Urgent Ticket</h2>
+                </div>
 
-              <CurrentTicketCard
-                ticket={displayTask}
-                onNavigate={(latitude, longitude) => {
-                  window.open(
-                    `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}`,
-                    "_blank",
-                    "noopener,noreferrer",
-                  )
-                }}
-                onUpdate={async (ticketId, note) => {
-                  await handleUpdateProgress(ticketId, note)
-                }}
-                onStatusChange={async (ticketId, newStatus) => {
-                  await updateTaskStatus(ticketId, newStatus as "in_progress" | "resolved" | "escalated")
-                }}
-                onMarkCompleted={(_ticketId) => setIsCompletionModalOpen(true)}
-              />
-            </section>
-          </aside>
-        ) : null}
+                <CurrentTicketCard
+                  ticket={displayTask}
+                  onNavigate={(latitude, longitude) => {
+                    window.open(
+                      `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}`,
+                      "_blank",
+                      "noopener,noreferrer",
+                    )
+                  }}
+                  onUpdate={async (ticketId, note) => {
+                    await handleUpdateProgress(ticketId, note)
+                  }}
+                  onStatusChange={async (ticketId, newStatus) => {
+                    await updateTaskStatus(ticketId, newStatus as "in_progress" | "pending_closure" | "resolved" | "escalated")
+                  }}
+                  onMarkAbsent={handleMarkAbsent}
+                  onMarkCompleted={(_ticketId) => setIsCompletionModalOpen(true)}
+                />
+              </section>
+            ) : null}
+
+            {pendingTask ? (
+              <section className="flex flex-1 flex-col rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-[#2a2a2a] dark:bg-[#1e1e1e]">
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Pending Ticket</h2>
+                  <span className="text-xs text-gray-400 dark:text-gray-500">Live status</span>
+                </div>
+                <PendingTicketCard
+                  ticket={pendingTask}
+                  onNavigate={(latitude, longitude) => {
+                    window.open(
+                      `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}`,
+                      "_blank",
+                      "noopener,noreferrer",
+                    )
+                  }}
+                  onUpdate={async (ticketId, note) => {
+                    await handleUpdateProgress(ticketId, note)
+                  }}
+                  onStatusChange={async (ticketId, newStatus) => {
+                    await updateTaskStatus(ticketId, newStatus as "in_progress" | "pending_closure" | "resolved" | "escalated")
+                  }}
+                  onMarkAbsent={handleMarkAbsent}
+                  onMarkCompleted={(_ticketId) => setIsCompletionModalOpen(true)}
+                />
+              </section>
+            ) : null}
+          </div>
+        </aside>
       </section>
 
       {isCompletionModalOpen && displayTask ? (
@@ -518,16 +960,29 @@ export default function WorkerDashboardPage() {
             onClick={() => setIsCompletionModalOpen(false)}
           />
           <div className="relative z-10 w-full max-w-md rounded-xl border border-gray-200 bg-white p-4 shadow-lg sm:p-5 dark:border-[#2a2a2a] dark:bg-[#1e1e1e]">
-            <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">Complete Ticket</h3>
-            <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">
-              Ticket {displayTask.ticketId} will be marked completed. Photo upload is reserved for the next phase.
-            </p>
+            <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">Mark Repair as Complete</h3>
+            {displayTask.cameraId ? (
+              <p className="mt-1 text-sm text-amber-600 dark:text-amber-400">
+                ⚠️ This is a CCTV ticket. After submission, the Admin Surveillance card will activate for verification.
+              </p>
+            ) : (
+              <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">
+                Ticket {displayTask.ticketId} will be sent to the citizen for confirmation before final closure.
+              </p>
+            )}
 
-            <label className="mt-4 block text-xs font-medium text-gray-600 dark:text-gray-300">Proof image (future flow)</label>
+            <label className="mt-4 block text-xs font-medium text-gray-600 dark:text-gray-300">
+              Proof photo <span className="text-gray-400">(recommended)</span>
+            </label>
             <input
               type="file"
+              accept="image/*"
+              onChange={(e) => setProofPhoto(e.target.files?.[0] ?? null)}
               className="mt-2 block w-full rounded-lg border border-gray-300 bg-white p-2 text-sm text-gray-700 dark:border-[#3a3a3a] dark:bg-[#1a1a1a] dark:text-gray-200"
             />
+            {proofPhoto && (
+              <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">✓ {proofPhoto.name} selected</p>
+            )}
 
             <label className="mt-3 block text-xs font-medium text-gray-600 dark:text-gray-300">Completion note (optional)</label>
             <textarea
@@ -541,17 +996,19 @@ export default function WorkerDashboardPage() {
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
+                disabled={isSubmitting}
                 onClick={() => setIsCompletionModalOpen(false)}
-                className="rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 dark:border-[#3a3a3a] dark:text-gray-200 dark:hover:bg-[#2a2a2a]"
+                className="rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-[#3a3a3a] dark:text-gray-200 dark:hover:bg-[#2a2a2a]"
               >
                 Cancel
               </button>
               <button
                 type="button"
+                disabled={isSubmitting}
                 onClick={handleConfirmComplete}
-                className="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+                className="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
               >
-                Confirm Complete
+                {isSubmitting ? 'Submitting...' : 'Submit Completion'}
               </button>
             </div>
           </div>
